@@ -11,6 +11,10 @@
 (define-constant ERR-LISTING-EXPIRED (err u106))
 (define-constant ERR-INVALID-PRICE (err u107))
 (define-constant ERR-SELF-TRANSFER (err u108))
+(define-constant ERR-INVALID-PRINCIPAL (err u109))
+(define-constant ERR-INVALID-PARAMETER (err u110))
+(define-constant ERR-EMPTY-STRING (err u111))
+(define-constant ERR-INVALID-ATTRIBUTES (err u112))
 
 ;; Data definitions
 (define-data-var contract-owner principal tx-sender)
@@ -71,6 +75,46 @@
       (ok (some (var-get contract-owner)))
       (ok none))))
 
+;; Validation functions
+(define-private (is-valid-principal (principal-to-check principal))
+  (not (is-eq principal-to-check 'SP000000000000000000002Q6VF78)))
+
+(define-private (is-valid-string-ascii (str (string-ascii 64)))
+  (> (len str) u0))
+
+(define-private (is-valid-string-utf8 (str (string-utf8 256)))
+  (> (len str) u0))
+
+(define-private (is-valid-string-utf8-long (str (string-utf8 1024)))
+  (> (len str) u0))
+
+(define-private (is-valid-rarity (rarity uint))
+  (and (>= rarity u1) (<= rarity u10)))
+
+;; Validate a single attribute
+(define-private (is-valid-attribute (attr {trait-type: (string-ascii 32), value: (string-utf8 64)}))
+  (and
+    (> (len (get trait-type attr)) u0)
+    (> (len (get value attr)) u0)
+  ))
+
+;; Validate the entire attributes list
+(define-private (validate-attributes (attrs (list 20 {trait-type: (string-ascii 32), value: (string-utf8 64)})))
+  (let
+    (
+      (attrs-len (len attrs))
+    )
+    ;; Check if list is not empty and validate each attribute
+    (and
+      (> attrs-len u0)
+      (fold check-attribute attrs true)
+    )
+  ))
+
+;; Helper function to check each attribute in the list
+(define-private (check-attribute (attr {trait-type: (string-ascii 32), value: (string-utf8 64)}) (valid bool))
+  (and valid (is-valid-attribute attr)))
+
 ;; Authorization functions
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
@@ -79,6 +123,7 @@
 (define-public (set-contract-owner (new-owner principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal new-owner) ERR-INVALID-PRINCIPAL)
     (ok (var-set contract-owner new-owner))
   )
 )
@@ -133,8 +178,26 @@
     (
       (new-item-id (+ (var-get total-items) u1))
     )
+    ;; Authorization check
     (asserts! (or (is-eq tx-sender (var-get contract-owner))
                   (is-whitelisted tx-sender)) ERR-NOT-AUTHORIZED)
+    
+    ;; Input validation
+    (asserts! (is-valid-string-ascii name) ERR-EMPTY-STRING)
+    (asserts! (is-valid-string-utf8 description) ERR-EMPTY-STRING)
+    (asserts! (is-valid-string-utf8 image-uri) ERR-EMPTY-STRING)
+    (asserts! (is-valid-string-ascii item-type) ERR-EMPTY-STRING)
+    (asserts! (is-valid-rarity rarity) ERR-INVALID-PARAMETER)
+    
+    ;; Validate attributes list
+    (asserts! (validate-attributes attributes) ERR-INVALID-ATTRIBUTES)
+    
+    ;; Optional metadata validation
+    (if (is-some metadata)
+      (asserts! (is-valid-string-utf8-long (unwrap! metadata ERR-INVALID-PARAMETER)) ERR-EMPTY-STRING)
+      true)
+    
+    ;; Create the item
     (map-set items new-item-id {
       name: name,
       description: description,
@@ -158,6 +221,7 @@
 (define-public (add-to-whitelist (creator principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal creator) ERR-INVALID-PRINCIPAL)
     (ok (map-set creator-whitelist creator true))
   )
 )
@@ -165,6 +229,7 @@
 (define-public (remove-from-whitelist (creator principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-principal creator) ERR-INVALID-PRINCIPAL)
     (ok (map-set creator-whitelist creator false))
   )
 )
@@ -180,8 +245,13 @@
       (item (unwrap! (map-get? items item-id) ERR-ITEM-NOT-FOUND))
       (current-qty (default-to u0 (map-get? item-owners {item-id: item-id, owner: recipient})))
     )
+    ;; Authorization check
     (asserts! (or (is-eq tx-sender (var-get contract-owner))
                   (is-eq tx-sender (get creator item))) ERR-NOT-AUTHORIZED)
+    
+    ;; Input validation
+    (asserts! (> quantity u0) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
     
     ;; Update the ownership mapping
     (map-set item-owners {item-id: item-id, owner: recipient} (+ current-qty quantity))
@@ -206,6 +276,10 @@
         (map-get? item-owners {item-id: item-id, owner: recipient})))
       (item (unwrap! (map-get? items item-id) ERR-ITEM-NOT-FOUND))
     )
+    ;; Input validation
+    (asserts! (> amount u0) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
+    
     ;; Check authorization and balance
     (asserts! (or (is-eq tx-sender sender) 
                   (is-eq tx-sender (var-get contract-owner))) ERR-NOT-AUTHORIZED)
@@ -246,6 +320,7 @@
       (owner-balance (get-item-balance item-id tx-sender))
       (item (unwrap! (map-get? items item-id) ERR-ITEM-NOT-FOUND))
     )
+    ;; Input validation
     (asserts! (>= owner-balance quantity) ERR-INSUFFICIENT-BALANCE)
     (asserts! (> price u0) ERR-INVALID-PRICE)
     (asserts! (> quantity u0) ERR-INVALID-PRICE)
@@ -300,6 +375,9 @@
       (admin-fee (/ (* total-price (var-get admin-fee-basis-points)) u10000))
       (seller-amount (- total-price admin-fee))
     )
+    ;; Input validation
+    (asserts! (> quantity u0) ERR-INVALID-PARAMETER)
+    
     ;; Check listing validity
     (asserts! (get active listing) ERR-LISTING-NOT-FOUND)
     (asserts! (<= block-height (get expiry listing)) ERR-LISTING-EXPIRED)
@@ -366,6 +444,8 @@
     (
       (owner-balance (get-item-balance item-id tx-sender))
     )
+    ;; Input validation
+    (asserts! (> amount u0) ERR-INVALID-PARAMETER)
     (asserts! (>= owner-balance amount) ERR-INSUFFICIENT-BALANCE)
     
     ;; Reduce balance
@@ -397,9 +477,15 @@
     (
       (upgrade-id (var-get next-upgrade-id))
     )
+    ;; Authorization check
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    
+    ;; Input validation
     (asserts! (is-some (map-get? items base-item-id)) ERR-ITEM-NOT-FOUND)
     (asserts! (is-some (map-get? items result-item-id)) ERR-ITEM-NOT-FOUND)
+    
+    ;; Validate required items list
+    (asserts! (> (len required-items) u0) ERR-INVALID-PARAMETER)
     
     (map-set item-upgrades upgrade-id {
       base-item-id: base-item-id,
@@ -464,7 +550,11 @@
     (
       (upgrade-data (unwrap! (map-get? item-upgrades upgrade-id) ERR-ITEM-NOT-FOUND))
     )
+    ;; Authorization check
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    
+    ;; Input validation
+    (asserts! (is-some (map-get? item-upgrades upgrade-id)) ERR-ITEM-NOT-FOUND)
     
     (map-set item-upgrades upgrade-id 
       (merge upgrade-data {enabled: enabled}))
@@ -479,8 +569,12 @@
     (
       (item (unwrap! (map-get? items item-id) ERR-ITEM-NOT-FOUND))
     )
+    ;; Authorization check
     (asserts! (or (is-eq tx-sender (var-get contract-owner))
                   (is-eq tx-sender (get creator item))) ERR-NOT-AUTHORIZED)
+    
+    ;; Input validation
+    (asserts! (is-valid-string-utf8-long metadata) ERR-EMPTY-STRING)
     
     (map-set items item-id 
       (merge item {metadata: (some metadata)}))
@@ -495,6 +589,7 @@
     (
       (item (unwrap! (map-get? items item-id) ERR-ITEM-NOT-FOUND))
     )
+    ;; Authorization check
     (asserts! (or (is-eq tx-sender (var-get contract-owner))
                   (is-eq tx-sender (get creator item))) ERR-NOT-AUTHORIZED)
     
